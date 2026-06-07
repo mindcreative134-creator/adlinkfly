@@ -1,0 +1,12 @@
+/config/configure.php
+/config/email.php
+/config/app_vars.php
+/tmp/*
+!/tmp/empty
+/logs/*
+!/logs/empty
+/logs/vendor/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
