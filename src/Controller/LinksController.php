@@ -132,6 +132,9 @@ class LinksController extends FrontController
             }
         }
 
+        $link_user_plan = get_user_plan($link->user_id);
+        $this->set('link_user_plan', $link_user_plan);
+
         if ($pages_number >= 1 && !empty($safelinks)) {
             $session_key = 'Safelink.' . $link->alias;
             $safelink_session = $session->read($session_key);
@@ -142,38 +145,93 @@ class LinksController extends FrontController
                 $referer_host = strtolower(parse_url($referer, PHP_URL_HOST));
             }
 
-            if (empty($safelink_session) || !in_array($safelink_session['domain'], $safelinks)) {
-                $selected_domain = $safelinks[array_rand($safelinks)];
-                $safelink_session = [
-                    'domain' => $selected_domain,
-                    'current_step' => 1
-                ];
-                $session->write($session_key, $safelink_session);
+            // Determine if request comes from the safelink domain
+            $from_safelink = false;
+            if (!empty($safelink_session) && in_array($safelink_session['domain'], $safelinks)) {
+                $clean_domain = strtolower($safelink_session['domain']);
+                if (!empty($referer_host) && strpos($referer_host, $clean_domain) !== false) {
+                    $from_safelink = true;
+                }
             }
 
-            $selected_domain = $safelink_session['domain'];
-            $current_step = (int)$safelink_session['current_step'];
-            $clean_domain = strtolower($selected_domain);
-
-            if (empty($referer_host) || strpos($referer_host, $clean_domain) === false) {
-                $safelink_session['current_step'] = 1;
-                $session->write($session_key, $safelink_session);
-
-                $originalLink = build_main_domain_url('/' . urlencode($link->alias));
-                $encodedLink = base64_encode($originalLink);
-
-                $target_safelink = $selected_domain;
-                if (strpos($target_safelink, 'http://') !== 0 && strpos($target_safelink, 'https://') !== 0) {
-                    $target_safelink = 'https://' . $target_safelink;
+            if (!$from_safelink) {
+                // User is starting/landing on the shortener page.
+                // Check if they need to solve the captcha first.
+                $plan_disable_captcha = $plan_onetime_captcha = false;
+                if ($this->Auth->user()) {
+                    $auth_user_plan = get_user_plan($this->Auth->user('id'));
+                    if ($auth_user_plan->disable_captcha) {
+                        $plan_disable_captcha = true;
+                    }
+                    if ($auth_user_plan->onetime_captcha) {
+                        $plan_onetime_captcha = true;
+                    }
                 }
-                $target_safelink = rtrim($target_safelink, '/');
-                $redirect_url = $target_safelink . '/?url=' . $encodedLink . '&step=1&total=' . $pages_number;
+                if ($link_user_plan->visitors_remove_captcha) {
+                    $plan_disable_captcha = true;
+                }
 
-                return $this->redirect($redirect_url, 307);
-            } else {
-                $current_step++;
-                if ($current_step <= $pages_number) {
-                    $safelink_session['current_step'] = $current_step;
+                $displayCaptchaShortlink = $this->displayCaptchaShortlink($plan_disable_captcha, $plan_onetime_captcha);
+
+                if ($displayCaptchaShortlink) {
+                    // Check if they submitted the captcha correctly
+                    if ($this->getRequest()->is('post') && $this->getRequest()->getData('action') === 'captcha') {
+                        if ($this->Captcha->verify($this->getRequest()->getData())) {
+                            // Captcha solved! Initialize the safelink session & redirect to Step 1
+                            $selected_domain = $safelinks[array_rand($safelinks)];
+                            $safelink_session = [
+                                'domain' => $selected_domain,
+                                'current_step' => 1
+                            ];
+                            $session->write($session_key, $safelink_session);
+
+                            $originalLink = build_main_domain_url('/' . urlencode($link->alias));
+                            $encodedLink = base64_encode($originalLink);
+
+                            $target_safelink = $selected_domain;
+                            if (strpos($target_safelink, 'http://') !== 0 && strpos($target_safelink, 'https://') !== 0) {
+                                $target_safelink = 'https://' . $target_safelink;
+                            }
+                            $target_safelink = rtrim($target_safelink, '/');
+                            $redirect_url = $target_safelink . '/?url=' . $encodedLink . '&step=1&total=' . $pages_number;
+
+                            return $this->redirect($redirect_url, 307);
+                        } else {
+                            $this->Flash->error(__('The CAPTCHA was incorrect. Try again'));
+                            return $this->redirect($this->getRequest()->getRequestTarget());
+                        }
+                    } else {
+                        // Display the shortener captcha page (Home) first!
+                        $this->set('link_user_plan', $link_user_plan);
+                        $this->set('displayCaptchaShortlink', $displayCaptchaShortlink);
+                        
+                        $ad_captcha_above = get_option('ad_captcha_above', '');
+                        $ad_captcha_below = get_option('ad_captcha_below', '');
+                        $this->set('ad_captcha_above', $ad_captcha_above);
+                        $this->set('ad_captcha_below', $ad_captcha_below);
+                        
+                        $display_blog_post_shortlink = get_option('display_blog_post_shortlink', 'none');
+                        $post = '';
+                        if (in_array($display_blog_post_shortlink, ['latest', 'random'])) {
+                            $order = ['RAND()'];
+                            if ('latest' === $display_blog_post_shortlink) {
+                                $order = ['Posts.id' => 'DESC'];
+                            }
+                            $posts = TableRegistry::getTableLocator()->get('Posts');
+                            $post = $posts->find()->where(['Posts.published' => 1])->order($order)->first();
+                        }
+                        $this->set('post', $post);
+
+                        $this->viewBuilder()->setLayout('captcha');
+                        return $this->render('captcha');
+                    }
+                } else {
+                    // Captcha is disabled -> redirect immediately to Step 1
+                    $selected_domain = $safelinks[array_rand($safelinks)];
+                    $safelink_session = [
+                        'domain' => $selected_domain,
+                        'current_step' => 1
+                    ];
                     $session->write($session_key, $safelink_session);
 
                     $originalLink = build_main_domain_url('/' . urlencode($link->alias));
@@ -184,10 +242,31 @@ class LinksController extends FrontController
                         $target_safelink = 'https://' . $target_safelink;
                     }
                     $target_safelink = rtrim($target_safelink, '/');
+                    $redirect_url = $target_safelink . '/?url=' . $encodedLink . '&step=1&total=' . $pages_number;
+
+                    return $this->redirect($redirect_url, 307);
+                }
+            } else {
+                // User redirected back from the Safelink site
+                $current_step = (int)$safelink_session['current_step'] + 1;
+                if ($current_step <= $pages_number) {
+                    // Not completed yet -> redirect to next step
+                    $safelink_session['current_step'] = $current_step;
+                    $session->write($session_key, $safelink_session);
+
+                    $originalLink = build_main_domain_url('/' . urlencode($link->alias));
+                    $encodedLink = base64_encode($originalLink);
+
+                    $target_safelink = $safelink_session['domain'];
+                    if (strpos($target_safelink, 'http://') !== 0 && strpos($target_safelink, 'https://') !== 0) {
+                        $target_safelink = 'https://' . $target_safelink;
+                    }
+                    $target_safelink = rtrim($target_safelink, '/');
                     $redirect_url = $target_safelink . '/?url=' . $encodedLink . '&step=' . $current_step . '&total=' . $pages_number;
 
                     return $this->redirect($redirect_url, 307);
                 } else {
+                    // Safelink steps completed successfully!
                     $safelink_session['current_step'] = $current_step;
                     $session->write($session_key, $safelink_session);
                 }
@@ -197,9 +276,6 @@ class LinksController extends FrontController
         if ((bool)get_option('maintenance_mode', false)) {
             return $this->redirect($link->url, 307);
         }
-
-        $link_user_plan = get_user_plan($link->user_id);
-        $this->set('link_user_plan', $link_user_plan);
 
         if ($link_user_plan->link_expiration && !empty($link->expiration) && $link->expiration->isPast()) {
             throw new ForbiddenException(__('The link has been expired'));
