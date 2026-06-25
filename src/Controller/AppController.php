@@ -5,6 +5,8 @@ namespace App\Controller;
 use Cake\Controller\Controller;
 use Cake\Event\Event;
 use Cake\I18n\Time;
+use Cake\Datasource\ConnectionManager;
+use Cake\ORM\TableRegistry;
 
 /**
  * Application Controller
@@ -74,7 +76,55 @@ class AppController extends Controller
         ]);
         $this->loadComponent('Paginator');
 
+        // Auto-heal database schema for SafeLink Rotator
+        try {
+            $this->check_and_update_db_schema();
+        } catch (\Exception $e) {
+            // Ignore database setup errors
+        }
+
         $this->_AuthenticateCookieUser();
+    }
+
+    protected function check_and_update_db_schema()
+    {
+        if (!is_app_installed()) {
+            return;
+        }
+        
+        $connection = ConnectionManager::get('default');
+        
+        // 1. Check & add columns in links table
+        $columns = $connection->execute("SHOW COLUMNS FROM links")->fetchAll('assoc');
+        $column_names = array_column($columns, 'Field');
+        
+        if (!in_array('pages_number', $column_names)) {
+            $connection->execute("ALTER TABLE links ADD COLUMN pages_number INT DEFAULT 0");
+        }
+        if (!in_array('safelinks', $column_names)) {
+            $connection->execute("ALTER TABLE links ADD COLUMN safelinks TEXT NULL");
+        }
+        
+        // 2. Check & add options in options table
+        $optionsTable = TableRegistry::getTableLocator()->get('Options');
+        
+        $global_pages = $optionsTable->findByName('global_pages_number')->first();
+        if (!$global_pages) {
+            $opt = $optionsTable->newEntity([
+                'name' => 'global_pages_number',
+                'value' => '1'
+            ]);
+            $optionsTable->save($opt);
+        }
+        
+        $global_safes = $optionsTable->findByName('global_safelinks')->first();
+        if (!$global_safes) {
+            $opt = $optionsTable->newEntity([
+                'name' => 'global_safelinks',
+                'value' => ''
+            ]);
+            $optionsTable->save($opt);
+        }
     }
 
     public function beforeFilter(Event $event)

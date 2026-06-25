@@ -72,6 +72,25 @@ $this->assign('content_title', __('Edit Link: {0}', $link->alias));
         }
         ?>
 
+        <?=
+        $this->Form->control('pages_number', [
+            'label' => __('SafeLink Pages Count (0 to disable)'),
+            'class' => 'form-control',
+            'type' => 'number',
+            'min' => 0,
+            'default' => 0,
+        ]);
+        ?>
+
+        <?=
+        $this->Form->control('safelinks', [
+            'label' => __('SafeLinks Domain Pool (One domain/URL per line)'),
+            'class' => 'form-control',
+            'type' => 'textarea',
+            'placeholder' => "example1.com\nexample2.com",
+        ]);
+        ?>
+
         <?= $this->Form->button(__('Submit'), ['class' => 'btn btn-primary']); ?>
 
         <?= $this->Form->end(); ?>

@@ -7,6 +7,7 @@ use Cake\Http\Exception\ForbiddenException;
 use Cake\Http\Exception\NotFoundException;
 use Cake\I18n\Time;
 use Cake\ORM\TableRegistry;
+use Cake\Datasource\ConnectionManager;
 
 /**
  * @property \App\Model\Table\LinksTable $Links
@@ -19,6 +20,49 @@ class LinksController extends FrontController
         parent::initialize();
         $this->loadComponent('Cookie');
         $this->loadComponent('Captcha');
+
+        try {
+            $this->check_and_update_db_schema();
+        } catch (\Exception $e) {
+            // Ignore database setup errors
+        }
+    }
+
+    protected function check_and_update_db_schema()
+    {
+        $connection = ConnectionManager::get('default');
+        
+        // 1. Check & add columns in links table
+        $columns = $connection->execute("SHOW COLUMNS FROM links")->fetchAll('assoc');
+        $column_names = array_column($columns, 'Field');
+        
+        if (!in_array('pages_number', $column_names)) {
+            $connection->execute("ALTER TABLE links ADD COLUMN pages_number INT DEFAULT 0");
+        }
+        if (!in_array('safelinks', $column_names)) {
+            $connection->execute("ALTER TABLE links ADD COLUMN safelinks TEXT NULL");
+        }
+        
+        // 2. Check & add options in options table
+        $optionsTable = TableRegistry::getTableLocator()->get('Options');
+        
+        $global_pages = $optionsTable->findByName('global_pages_number')->first();
+        if (!$global_pages) {
+            $opt = $optionsTable->newEntity([
+                'name' => 'global_pages_number',
+                'value' => '1'
+            ]);
+            $optionsTable->save($opt);
+        }
+        
+        $global_safes = $optionsTable->findByName('global_safelinks')->first();
+        if (!$global_safes) {
+            $opt = $optionsTable->newEntity([
+                'name' => 'global_safelinks',
+                'value' => ''
+            ]);
+            $optionsTable->save($opt);
+        }
     }
 
     public function beforeFilter(Event $event)
@@ -65,6 +109,90 @@ class LinksController extends FrontController
             throw new NotFoundException(__('404 Not Found'));
         }
         $this->set('link', $link);
+
+        $session = $this->getRequest()->getSession();
+        $pages_number = (int)$link->pages_number;
+        if ($pages_number <= 0) {
+            $pages_number = (int)get_option('global_pages_number', 1);
+        }
+        $safelinks_str = trim($link->safelinks);
+        if (empty($safelinks_str)) {
+            $safelinks_str = trim(get_option('global_safelinks', ''));
+        }
+
+        $safelinks = [];
+        if (!empty($safelinks_str)) {
+            $lines = explode("\n", $safelinks_str);
+            foreach ($lines as $line) {
+                $line = trim($line);
+                if (!empty($line)) {
+                    $parsed_url = parse_url($line);
+                    $safelinks[] = isset($parsed_url['host']) ? $parsed_url['host'] : $line;
+                }
+            }
+        }
+
+        if ($pages_number >= 1 && !empty($safelinks)) {
+            $session_key = 'Safelink.' . $link->alias;
+            $safelink_session = $session->read($session_key);
+
+            $referer = isset($_SERVER['HTTP_REFERER']) ? $_SERVER['HTTP_REFERER'] : '';
+            $referer_host = '';
+            if (!empty($referer)) {
+                $referer_host = strtolower(parse_url($referer, PHP_URL_HOST));
+            }
+
+            if (empty($safelink_session) || !in_array($safelink_session['domain'], $safelinks)) {
+                $selected_domain = $safelinks[array_rand($safelinks)];
+                $safelink_session = [
+                    'domain' => $selected_domain,
+                    'current_step' => 1
+                ];
+                $session->write($session_key, $safelink_session);
+            }
+
+            $selected_domain = $safelink_session['domain'];
+            $current_step = (int)$safelink_session['current_step'];
+            $clean_domain = strtolower($selected_domain);
+
+            if (empty($referer_host) || strpos($referer_host, $clean_domain) === false) {
+                $safelink_session['current_step'] = 1;
+                $session->write($session_key, $safelink_session);
+
+                $originalLink = build_main_domain_url('/' . urlencode($link->alias));
+                $encodedLink = base64_encode($originalLink);
+
+                $target_safelink = $selected_domain;
+                if (strpos($target_safelink, 'http://') !== 0 && strpos($target_safelink, 'https://') !== 0) {
+                    $target_safelink = 'https://' . $target_safelink;
+                }
+                $target_safelink = rtrim($target_safelink, '/');
+                $redirect_url = $target_safelink . '/?url=' . $encodedLink . '&step=1&total=' . $pages_number;
+
+                return $this->redirect($redirect_url, 307);
+            } else {
+                $current_step++;
+                if ($current_step <= $pages_number) {
+                    $safelink_session['current_step'] = $current_step;
+                    $session->write($session_key, $safelink_session);
+
+                    $originalLink = build_main_domain_url('/' . urlencode($link->alias));
+                    $encodedLink = base64_encode($originalLink);
+
+                    $target_safelink = $selected_domain;
+                    if (strpos($target_safelink, 'http://') !== 0 && strpos($target_safelink, 'https://') !== 0) {
+                        $target_safelink = 'https://' . $target_safelink;
+                    }
+                    $target_safelink = rtrim($target_safelink, '/');
+                    $redirect_url = $target_safelink . '/?url=' . $encodedLink . '&step=' . $current_step . '&total=' . $pages_number;
+
+                    return $this->redirect($redirect_url, 307);
+                } else {
+                    $safelink_session['current_step'] = $current_step;
+                    $session->write($session_key, $safelink_session);
+                }
+            }
+        }
 
         if ((bool)get_option('maintenance_mode', false)) {
             return $this->redirect($link->url, 307);
@@ -165,6 +293,16 @@ class LinksController extends FrontController
         $this->set('post', $post);
 
         $displayCaptchaShortlink = $this->displayCaptchaShortlink($plan_disable_captcha, $plan_onetime_captcha);
+
+        // If safelink is enabled and they have completed all steps, bypass captcha
+        if ($pages_number >= 1 && !empty($safelinks)) {
+            $session_key = 'Safelink.' . $link->alias;
+            $safelink_session = $session->read($session_key);
+            if (!empty($safelink_session) && $safelink_session['current_step'] > $pages_number) {
+                $displayCaptchaShortlink = false;
+            }
+        }
+
         $this->set('displayCaptchaShortlink', $displayCaptchaShortlink);
 
         if ($this->getRequest()->getData('action') !== 'captcha') {
@@ -180,120 +318,120 @@ class LinksController extends FrontController
             }
         }
 
-        $this->viewBuilder()->setLayout('captcha');
-        $this->render('captcha');
-
         if (
-            !$displayCaptchaShortlink ||
-            ($this->getRequest()->is('post') && $this->getRequest()->getData('action') !== 'continue')
+            $displayCaptchaShortlink &&
+            (!$this->getRequest()->is('post') || $this->getRequest()->getData('action') === 'continue')
         ) {
-            if ($displayCaptchaShortlink && !$this->Captcha->verify($this->getRequest()->getData())) {
-                $this->Flash->error(__('The CAPTCHA was incorrect. Try again'));
+            $this->viewBuilder()->setLayout('captcha');
+            return $this->render('captcha');
+        }
 
-                return $this->redirect($this->getRequest()->getRequestTarget());
+        if ($displayCaptchaShortlink && !$this->Captcha->verify($this->getRequest()->getData())) {
+            $this->Flash->error(__('The CAPTCHA was incorrect. Try again'));
+
+            return $this->redirect($this->getRequest()->getRequestTarget());
+        }
+
+        $this->setVisitorCookie();
+
+        $country = $this->Links->Statistics->get_country(get_ip());
+        $this->set('country', $country);
+
+        if ($detector->isMobile()) {
+            $traffic_source = 3; // Mobile & Tablet
+        } else {
+            $traffic_source = 2; // Desktop
+        }
+
+        $paidAds = (object)$this->getPaidAds($ad_type, $traffic_source, $country);
+        $this->set('paidAds', $paidAds);
+
+        if (get_option('enable_popup', 'yes') == 'yes') {
+            $popupPaidAds = (object)$this->getPaidAds(3, $traffic_source, $country);
+            $show_pop_ad = false;
+            $pop_ad = [];
+            if ($popupPaidAds) {
+                $pop_ad = [
+                    'mode' => $popupPaidAds->mode,
+                    'link' => $link,
+                    'website_url' => $popupPaidAds->website_url,
+                    'alias' => $link->alias,
+                    'ci' => $popupPaidAds->ci,
+                    'cui' => $popupPaidAds->cui,
+                    'cii' => $popupPaidAds->cii,
+                    'country' => $country,
+                    'advertiser_price' => $popupPaidAds->advertiser_price,
+                    'publisher_price' => $popupPaidAds->publisher_price,
+                ];
+                $show_pop_ad = true;
             }
+            $this->set('show_pop_ad', $show_pop_ad);
+            $this->set('pop_ad', data_encrypt($pop_ad));
+        }
 
-            $this->setVisitorCookie();
+        $ad_form_data = [
+            'mode' => $paidAds->mode,
+            'alias' => $link->alias,
+            'ci' => $paidAds->ci,
+            'cui' => $paidAds->cui,
+            'cii' => $paidAds->cii,
+            'country' => $country,
+            'advertiser_price' => $paidAds->advertiser_price,
+            'publisher_price' => $paidAds->publisher_price,
+            'ad_type' => $ad_type,
+            'timer' => $link_user_plan->timer ?? 5,
+            't' => time(),
+        ];
 
-            $country = $this->Links->Statistics->get_country(get_ip());
-            $this->set('country', $country);
+        $this->set('ad_form_data', data_encrypt($ad_form_data));
 
-            if ($detector->isMobile()) {
-                $traffic_source = 3; // Mobile & Tablet
-            } else {
-                $traffic_source = 2; // Desktop
+        // Interstitial Ads
+        if ($ad_type == 1) {
+            $interstitial_banner_ad = get_option('interstitial_banner_ad', '');
+            $interstitial_ad_url = $paidAds->website_url;
+            if ($plan_disable_ads) {
+                $interstitial_banner_ad = '';
+                $interstitial_ad_url = '';
             }
+            $this->set('interstitial_banner_ad', $interstitial_banner_ad);
+            $this->set('interstitial_ad_url', $interstitial_ad_url);
 
-            $paidAds = (object)$this->getPaidAds($ad_type, $traffic_source, $country);
-            $this->set('paidAds', $paidAds);
+            $this->viewBuilder()->setLayout('go_interstitial');
+            return $this->render('view_interstitial');
+        }
 
-            if (get_option('enable_popup', 'yes') == 'yes') {
-                $popupPaidAds = (object)$this->getPaidAds(3, $traffic_source, $country);
-                $show_pop_ad = false;
-                $pop_ad = [];
-                if ($popupPaidAds) {
-                    $pop_ad = [
-                        'mode' => $popupPaidAds->mode,
-                        'link' => $link,
-                        'website_url' => $popupPaidAds->website_url,
-                        'alias' => $link->alias,
-                        'ci' => $popupPaidAds->ci,
-                        'cui' => $popupPaidAds->cui,
-                        'cii' => $popupPaidAds->cii,
-                        'country' => $country,
-                        'advertiser_price' => $popupPaidAds->advertiser_price,
-                        'publisher_price' => $popupPaidAds->publisher_price,
-                    ];
-                    $show_pop_ad = true;
-                }
-                $this->set('show_pop_ad', $show_pop_ad);
-                $this->set('pop_ad', data_encrypt($pop_ad));
-            }
+        // Banner Ads
+        if ($ad_type == 2) {
+            $banner_728x90 = get_option('banner_728x90', '');
+            $banner_468x60 = get_option('banner_468x60', '');
+            $banner_336x280 = get_option('banner_336x280', '');
 
-            $ad_form_data = [
-                'mode' => $paidAds->mode,
-                'alias' => $link->alias,
-                'ci' => $paidAds->ci,
-                'cui' => $paidAds->cui,
-                'cii' => $paidAds->cii,
-                'country' => $country,
-                'advertiser_price' => $paidAds->advertiser_price,
-                'publisher_price' => $paidAds->publisher_price,
-                'ad_type' => $ad_type,
-                'timer' => $link_user_plan->timer ?? 5,
-                't' => time(),
-            ];
-
-            $this->set('ad_form_data', data_encrypt($ad_form_data));
-
-            // Interstitial Ads
-            if ($ad_type == 1) {
-                $interstitial_banner_ad = get_option('interstitial_banner_ad', '');
-                $interstitial_ad_url = $paidAds->website_url;
-                if ($plan_disable_ads) {
-                    $interstitial_banner_ad = '';
-                    $interstitial_ad_url = '';
-                }
-                $this->set('interstitial_banner_ad', $interstitial_banner_ad);
-                $this->set('interstitial_ad_url', $interstitial_ad_url);
-
-                $this->viewBuilder()->setLayout('go_interstitial');
-                $this->render('view_interstitial');
-            }
-
-            // Banner Ads
-            if ($ad_type == 2) {
-                $banner_728x90 = get_option('banner_728x90', '');
-                $banner_468x60 = get_option('banner_468x60', '');
-                $banner_336x280 = get_option('banner_336x280', '');
-
-                if ($paidAds->mode === 'campaign') {
-                    if ('728x90' == $paidAds->banner_size) {
-                        $banner_728x90 = $paidAds->banner_code;
-                    }
-
-                    if ('468x60' == $paidAds->banner_size) {
-                        $banner_468x60 = $paidAds->banner_code;
-                    }
-
-                    if ('336x280' == $paidAds->banner_size) {
-                        $banner_336x280 = $paidAds->banner_code;
-                    }
+            if ($paidAds->mode === 'campaign') {
+                if ('728x90' == $paidAds->banner_size) {
+                    $banner_728x90 = $paidAds->banner_code;
                 }
 
-                if ($plan_disable_ads) {
-                    $banner_728x90 = '';
-                    $banner_468x60 = '';
-                    $banner_336x280 = '';
+                if ('468x60' == $paidAds->banner_size) {
+                    $banner_468x60 = $paidAds->banner_code;
                 }
 
-                $this->set('banner_728x90', $banner_728x90);
-                $this->set('banner_468x60', $banner_468x60);
-                $this->set('banner_336x280', $banner_336x280);
-
-                $this->viewBuilder()->setLayout('go_banner');
-                $this->render('view_banner');
+                if ('336x280' == $paidAds->banner_size) {
+                    $banner_336x280 = $paidAds->banner_code;
+                }
             }
+
+            if ($plan_disable_ads) {
+                $banner_728x90 = '';
+                $banner_468x60 = '';
+                $banner_336x280 = '';
+            }
+
+            $this->set('banner_728x90', $banner_728x90);
+            $this->set('banner_468x60', $banner_468x60);
+            $this->set('banner_336x280', $banner_336x280);
+
+            $this->viewBuilder()->setLayout('go_banner');
+            return $this->render('view_banner');
         }
     }
 
@@ -369,7 +507,38 @@ class LinksController extends FrontController
             return $this->getResponse();
         }
 
+        $pages_number = (int)$link->pages_number;
+        if ($pages_number <= 0) {
+            $pages_number = (int)get_option('global_pages_number', 1);
+        }
+        $safelinks_str = trim($link->safelinks);
+        if (empty($safelinks_str)) {
+            $safelinks_str = trim(get_option('global_safelinks', ''));
+        }
+
+        if ($pages_number >= 1 && !empty($safelinks_str)) {
+            $session = $this->getRequest()->getSession();
+            $session_key = 'Safelink.' . $link->alias;
+            $safelink_session = $session->read($session_key);
+
+            if (empty($safelink_session) || $safelink_session['current_step'] <= $pages_number) {
+                $content = [
+                    'status' => 'error',
+                    'message' => __('Please complete all steps first.'),
+                    'url' => '',
+                ];
+                $this->setResponse($this->getResponse()->withStringBody(json_encode($content)));
+
+                return $this->getResponse();
+            }
+        }
+
         $content = $this->calcEarnings($ad_form_data, $link, $ad_form_data['ad_type']);
+
+        if ($pages_number >= 1 && !empty($safelinks_str)) {
+            $session = $this->getRequest()->getSession();
+            $session->delete('Safelink.' . $link->alias);
+        }
 
         //$content['url'] = $content['url'];
 
@@ -488,6 +657,19 @@ class LinksController extends FrontController
                 ->bind(':country', $country, 'string')
                 ->limit(10)
                 ->toArray();
+        }
+
+        if (count($campaign_items) == 0) {
+            $paidAds->mode = 'simple';
+            $paidAds->advertiser_price = 0;
+            $paidAds->publisher_price = 0;
+            $paidAds->ci = 0;
+            $paidAds->cui = 0;
+            $paidAds->cii = 0;
+            $paidAds->website_url = '';
+            $paidAds->banner_size = '';
+            $paidAds->banner_code = '';
+            return $paidAds;
         }
 
         shuffle($campaign_items);

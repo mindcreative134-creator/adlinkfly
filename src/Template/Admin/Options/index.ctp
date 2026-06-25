@@ -1015,6 +1015,36 @@ $this->assign('content_title', __('Settings'));
             </div>
 
             <div class="row">
+                <div class="col-sm-2"><?= __('Global SafeLink Pages Count') ?></div>
+                <div class="col-sm-10">
+                    <?=
+                    $this->Form->control('Options.' . (isset($settings['global_pages_number']) ? $settings['global_pages_number']['id'] : '') . '.value', [
+                        'label' => false,
+                        'class' => 'form-control',
+                        'type' => 'number',
+                        'value' => isset($settings['global_pages_number']) ? $settings['global_pages_number']['value'] : 1,
+                    ]);
+                    ?>
+                    <span class="help-block"><?= __('Default number of steps/pages a user must visit before the link is unlocked (set to 0 to disable rotator).') ?></span>
+                </div>
+            </div>
+
+            <div class="row">
+                <div class="col-sm-2"><?= __('Global SafeLinks Pool') ?></div>
+                <div class="col-sm-10">
+                    <?=
+                    $this->Form->control('Options.' . (isset($settings['global_safelinks']) ? $settings['global_safelinks']['id'] : '') . '.value', [
+                        'label' => false,
+                        'class' => 'form-control',
+                        'type' => 'textarea',
+                        'value' => isset($settings['global_safelinks']) ? $settings['global_safelinks']['value'] : '',
+                    ]);
+                    ?>
+                    <span class="help-block"><?= __('Enter default SafeLink domains (one per line) to rotate users through.') ?></span>
+                </div>
+            </div>
+
+            <div class="row">
                 <div class="col-sm-2"><?= __('Make Link Info Available for Members') ?></div>
                 <div class="col-sm-10">
                     <?=
